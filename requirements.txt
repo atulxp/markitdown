@@ -1,0 +1,5 @@
+# Install local packages from this monorepo
+-e packages/markitdown
+-e packages/markitdown-mcp
+-e packages/markitdown-ocr
+-e packages/markitdown-sample-plugin

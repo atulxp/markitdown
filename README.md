@@ -68,6 +68,12 @@ cd markitdown
 pip install -e 'packages/markitdown[all]'
 ```
 
+For this monorepo setup, you can also install all local packages in editable mode via the root `requirements.txt`:
+
+```bash
+pip install -r requirements.txt
+```
+
 ## Usage
 
 ### Command-Line

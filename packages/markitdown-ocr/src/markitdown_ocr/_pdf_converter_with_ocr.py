@@ -14,6 +14,9 @@ from markitdown._exceptions import (
 )
 from ._ocr_service import LLMVisionOCRService
 
+_SCANNED_PAGE_HEADER_GAP = "\n\n\n\n\n"
+_SCANNED_PAGE_SEPARATOR = "\n\n\n\n"
+
 # Import dependencies
 _dependency_exc_info = None
 try:
@@ -109,11 +112,38 @@ def _extract_images_from_page(page: Any) -> list[dict]:
                     img_stream.seek(0)
 
                 if img_stream:
+                    # detect whether the image covers most of the page (full-page scan)
+                    is_full_page = False
+                    try:
+                        page_w = getattr(page, "width", None)
+                        page_h = getattr(page, "height", None)
+                        bbox = img_dict.get("bbox", [None, None, None, None])
+                        x0 = img_dict.get("x0") or bbox[0]
+                        y0 = img_dict.get("top") or bbox[1]
+                        x1 = img_dict.get("x1") or bbox[2]
+                        y1 = img_dict.get("bottom") or bbox[3]
+                        if (
+                            page_w
+                            and page_h
+                            and x0 is not None
+                            and x1 is not None
+                            and y0 is not None
+                            and y1 is not None
+                        ):
+                            w = abs(x1 - x0)
+                            h = abs(y1 - y0)
+                            # if image covers >80% of both width and height, consider full-page
+                            if w >= 0.8 * page_w and h >= 0.8 * page_h:
+                                is_full_page = True
+                    except Exception:
+                        is_full_page = False
+
                     images_info.append(
                         {
                             "stream": img_stream,
                             "name": f"page_{page.page_number}_img_{i}",
                             "y_pos": y_pos,
+                            "is_full_page": is_full_page,
                         }
                     )
 
@@ -182,112 +212,157 @@ class PdfConverterWithOCR(DocumentConverter):
         pdf_bytes = io.BytesIO(file_stream.read())
 
         markdown_content = []
+        markdown: str | None = None
 
         try:
             with pdfplumber.open(pdf_bytes) as pdf:
-                for page_num, page in enumerate(pdf.pages, 1):
-                    markdown_content.append(f"\n## Page {page_num}\n")
+                # Heuristic: if every page contains at least one image (e.g. a
+                # multipage scanned export where each page is an image), prefer
+                # full-page OCR for the entire document to avoid noisy interleaving.
+                total_pages = len(pdf.pages)
+                images_per_page = [
+                    self._extract_page_images(pdf_bytes, i + 1)
+                    for i in range(total_pages)
+                ]
+                if ocr_service and total_pages > 1 and all(
+                    len(imgs) >= 1 for imgs in images_per_page
+                ):
+                    # Use full-page OCR for all pages
+                    pdf_bytes.seek(0)
+                    markdown = self._ocr_full_pages(pdf_bytes, ocr_service)
+                else:
+                    for page_num, page in enumerate(pdf.pages, 1):
+                        # If OCR is enabled, interleave text and images by position
+                        if ocr_service:
+                            images_on_page = self._extract_page_images(
+                                pdf_bytes, page_num
+                            )
 
-                    # If OCR is enabled, interleave text and images by position
-                    if ocr_service:
-                        images_on_page = self._extract_page_images(pdf_bytes, page_num)
+                            if images_on_page:
+                                # If any image covers the majority of the page, treat the
+                                # page as a scanned full-page image and OCR the whole page.
+                                if any(img.get("is_full_page") for img in images_on_page):
+                                    try:
+                                        page_img = page.to_image(resolution=300)
+                                        img_stream = io.BytesIO()
+                                        page_img.original.save(img_stream, format="PNG")
+                                        img_stream.seek(0)
 
-                        if images_on_page:
-                            # Extract text lines with Y positions
-                            chars = page.chars
-                            if chars:
-                                # Group chars into lines based on Y position
-                                lines_with_y = []
-                                current_line = []
-                                current_y = None
-
-                                for char in sorted(
-                                    chars, key=lambda c: (c["top"], c["x0"])
-                                ):
-                                    y = char["top"]
-                                    if current_y is None:
-                                        current_y = y
-                                    elif abs(y - current_y) > 2:  # New line threshold
-                                        if current_line:
-                                            text = "".join(
-                                                [c["text"] for c in current_line]
+                                        ocr_result = ocr_service.extract_text(img_stream)
+                                        markdown_content.append(
+                                            self._format_scanned_page(
+                                                page_num, ocr_result.text
                                             )
-                                            lines_with_y.append(
-                                                {"y": current_y, "text": text.strip()}
-                                            )
-                                        current_line = []
-                                        current_y = y
-                                    current_line.append(char)
+                                        )
+                                    except Exception:
+                                        # fallback to existing interleaving logic below
+                                        pass
+                                    # continue to next page
+                                    continue
 
-                                # Add last line
-                                if current_line:
-                                    text = "".join([c["text"] for c in current_line])
-                                    lines_with_y.append(
-                                        {"y": current_y, "text": text.strip()}
+                                # For non-full-page image layouts, emit the page header
+                                markdown_content.append(f"\n## Page {page_num}\n")
+
+                                # Extract text lines with Y positions
+                                chars = page.chars
+                                if chars:
+                                    # Group chars into lines based on Y position
+                                    lines_with_y = []
+                                    current_line = []
+                                    current_y = None
+
+                                    for char in sorted(
+                                        chars, key=lambda c: (c["top"], c["x0"])
+                                    ):
+                                        y = char["top"]
+                                        if current_y is None:
+                                            current_y = y
+                                        elif abs(y - current_y) > 2:  # New line threshold
+                                            if current_line:
+                                                text = "".join(
+                                                    [c["text"] for c in current_line]
+                                                )
+                                                lines_with_y.append(
+                                                    {
+                                                        "y": current_y,
+                                                        "text": text.strip(),
+                                                    }
+                                                )
+                                            current_line = []
+                                            current_y = y
+                                        current_line.append(char)
+
+                                    # Add last line
+                                    if current_line:
+                                        text = "".join(
+                                            [c["text"] for c in current_line]
+                                        )
+                                        lines_with_y.append(
+                                            {"y": current_y, "text": text.strip()}
+                                        )
+                                else:
+                                    # Fallback: use simple text extraction
+                                    text_content = page.extract_text() or ""
+                                    lines_with_y = [
+                                        {"y": i * 10, "text": line}
+                                        for i, line in enumerate(text_content.split("\n"))
+                                    ]
+
+                                # OCR all images
+                                image_data = []
+                                for img_info in images_on_page:
+                                    ocr_result = ocr_service.extract_text(
+                                        img_info["stream"]
                                     )
-                            else:
-                                # Fallback: use simple text extraction
-                                text_content = page.extract_text() or ""
-                                lines_with_y = [
-                                    {"y": i * 10, "text": line}
-                                    for i, line in enumerate(text_content.split("\n"))
+                                    if ocr_result.text.strip():
+                                        image_data.append(
+                                            {
+                                                "y_pos": img_info["y_pos"],
+                                                "name": img_info["name"],
+                                                "ocr_text": ocr_result.text,
+                                                "backend": ocr_result.backend_used,
+                                                "type": "image",
+                                            }
+                                        )
+
+                                # Add text items
+                                content_items = [
+                                    {
+                                        "y_pos": item["y"],
+                                        "text": item["text"],
+                                        "type": "text",
+                                    }
+                                    for item in lines_with_y
+                                    if item["text"]
                                 ]
+                                content_items.extend(image_data)
 
-                            # OCR all images
-                            image_data = []
-                            for img_info in images_on_page:
-                                ocr_result = ocr_service.extract_text(
-                                    img_info["stream"]
-                                )
-                                if ocr_result.text.strip():
-                                    image_data.append(
-                                        {
-                                            "y_pos": img_info["y_pos"],
-                                            "name": img_info["name"],
-                                            "ocr_text": ocr_result.text,
-                                            "backend": ocr_result.backend_used,
-                                            "type": "image",
-                                        }
-                                    )
+                                # Sort all items by Y position (top to bottom)
+                                content_items.sort(key=lambda x: x["y_pos"])
 
-                            # Add text items
-                            content_items = [
-                                {
-                                    "y_pos": item["y"],
-                                    "text": item["text"],
-                                    "type": "text",
-                                }
-                                for item in lines_with_y
-                                if item["text"]
-                            ]
-                            content_items.extend(image_data)
-
-                            # Sort all items by Y position (top to bottom)
-                            content_items.sort(key=lambda x: x["y_pos"])
-
-                            # Build markdown by interleaving text and images
-                            for item in content_items:
-                                if item["type"] == "text":
-                                    markdown_content.append(item["text"])
-                                else:  # image
-                                    ocr_text = item["ocr_text"]
-                                    img_marker = (
-                                        f"\n\n*[Image OCR]\n{ocr_text}\n[End OCR]*\n"
-                                    )
-                                    markdown_content.append(img_marker)
+                                # Build markdown by interleaving text and images
+                                for item in content_items:
+                                    if item["type"] == "text":
+                                        markdown_content.append(item["text"])
+                                    else:  # image
+                                        ocr_text = item["ocr_text"]
+                                        img_marker = f"\n\n*[Image OCR]\n{ocr_text}\n[End OCR]*\n"
+                                        markdown_content.append(img_marker)
+                            else:
+                                # No images detected - just extract regular text
+                                markdown_content.append(f"\n## Page {page_num}\n")
+                                text_content = page.extract_text() or ""
+                                if text_content.strip():
+                                    markdown_content.append(text_content.strip())
                         else:
-                            # No images detected - just extract regular text
+                            # No OCR, just extract text
                             text_content = page.extract_text() or ""
                             if text_content.strip():
                                 markdown_content.append(text_content.strip())
-                    else:
-                        # No OCR, just extract text
-                        text_content = page.extract_text() or ""
-                        if text_content.strip():
-                            markdown_content.append(text_content.strip())
 
-                # Build final markdown
-                markdown = "\n\n".join(markdown_content).strip()
+                # Build final markdown if not already produced by an early path
+                if markdown is None:
+                    markdown = "\n\n".join(markdown_content).strip()
 
                 # Fallback to pdfminer if empty
                 if not markdown:
@@ -309,6 +384,21 @@ class PdfConverterWithOCR(DocumentConverter):
             markdown = self._ocr_full_pages(pdf_bytes, ocr_service)
 
         return DocumentConverterResult(markdown=markdown)
+
+    def _format_scanned_page(self, page_num: int, ocr_text: str | None) -> str:
+        """
+        Produce the canonical markdown for a scanned page.
+
+        Five newline characters after the header render as exactly four blank
+        lines before the OCR block.
+        """
+        header = f"## Page {page_num}"
+        if ocr_text and ocr_text.strip():
+            block = f"*[Image OCR]\n{ocr_text.strip()}\n[End OCR]*"
+        else:
+            block = "*[No text could be extracted from this page]*"
+
+        return header + _SCANNED_PAGE_HEADER_GAP + block
 
     def _extract_page_images(self, pdf_bytes: io.BytesIO, page_num: int) -> list[dict]:
         """
@@ -353,47 +443,40 @@ class PdfConverterWithOCR(DocumentConverter):
         """
         markdown_parts = []
 
+        # Primary approach: use pdfplumber to render each page and OCR it
         try:
             pdf_bytes.seek(0)
             with pdfplumber.open(pdf_bytes) as pdf:
-                for page_num, page in enumerate(pdf.pages, 1):
+                sections = []
+                for idx, page in enumerate(pdf.pages, 1):
                     try:
-                        markdown_parts.append(f"\n## Page {page_num}\n")
-
-                        # Render page to image
+                        # Render page to image at 300 DPI
                         page_img = page.to_image(resolution=300)
                         img_stream = io.BytesIO()
                         page_img.original.save(img_stream, format="PNG")
                         img_stream.seek(0)
 
-                        # Run OCR
                         ocr_result = ocr_service.extract_text(img_stream)
-
-                        if ocr_result.text.strip():
-                            text = ocr_result.text.strip()
-                            markdown_parts.append(f"*[Image OCR]\n{text}\n[End OCR]*")
-                        else:
-                            markdown_parts.append(
-                                "*[No text could be extracted from this page]*"
-                            )
-
-                    except Exception as e:
-                        markdown_parts.append(
-                            f"*[Error processing page {page_num}: {str(e)}]*"
+                        sections.append(
+                            self._format_scanned_page(idx, ocr_result.text)
                         )
+
+                    except Exception:
+                        sections.append(self._format_scanned_page(idx, None))
                         continue
 
+                markdown_parts = [_SCANNED_PAGE_SEPARATOR.join(sections)]
+
         except Exception:
-            # pdfplumber failed (e.g. malformed EOF) — try PyMuPDF for rendering
-            markdown_parts = []
+            # Fallback: pdfplumber failed (e.g., truncated/malformed PDF), use PyMuPDF
             try:
                 import fitz  # PyMuPDF
 
                 pdf_bytes.seek(0)
                 doc = fitz.open(stream=pdf_bytes.read(), filetype="pdf")
+                py_sections = []
                 for page_num in range(1, doc.page_count + 1):
                     try:
-                        markdown_parts.append(f"\n## Page {page_num}\n")
                         page = doc[page_num - 1]
                         mat = fitz.Matrix(300 / 72, 300 / 72)  # 300 DPI
                         pix = page.get_pixmap(matrix=mat)
@@ -401,21 +484,15 @@ class PdfConverterWithOCR(DocumentConverter):
                         img_stream.seek(0)
 
                         ocr_result = ocr_service.extract_text(img_stream)
-
-                        if ocr_result.text.strip():
-                            text = ocr_result.text.strip()
-                            markdown_parts.append(f"*[Image OCR]\n{text}\n[End OCR]*")
-                        else:
-                            markdown_parts.append(
-                                "*[No text could be extracted from this page]*"
-                            )
-
-                    except Exception as e:
-                        markdown_parts.append(
-                            f"*[Error processing page {page_num}: {str(e)}]*"
+                        py_sections.append(
+                            self._format_scanned_page(page_num, ocr_result.text)
                         )
+
+                    except Exception:
+                        py_sections.append(self._format_scanned_page(page_num, None))
                         continue
                 doc.close()
+                markdown_parts = [_SCANNED_PAGE_SEPARATOR.join(py_sections)]
             except Exception:
                 return "*[Error: Could not process scanned PDF]*"
 

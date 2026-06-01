@@ -31,6 +31,7 @@ TEST_DATA_DIR = Path(__file__).parent / "ocr_test_data"
 _MOCK_TEXT = "MOCK_OCR_TEXT_12345"
 _OCR_BLOCK = f"*[Image OCR]\n{_MOCK_TEXT}\n[End OCR]*"
 _PAGE_1_SCANNED = f"## Page 1\n\n\n\n\n{_OCR_BLOCK}"
+_SCANNED_PAGE_SEPARATOR = "\n\n\n\n"
 
 
 class MockOCRService:
@@ -56,6 +57,12 @@ def _convert(filename: str, ocr_service: MockOCRService) -> str:
         return converter.convert(
             f, StreamInfo(extension=".pdf"), ocr_service=ocr_service
         ).text_content
+
+
+def test_format_scanned_page_exact_spacing() -> None:
+    converter = PdfConverterWithOCR()
+    expected = f"## Page 7\n\n\n\n\n{_OCR_BLOCK}"
+    assert converter._format_scanned_page(7, f"\n{_MOCK_TEXT}\n") == expected
 
 
 # ---------------------------------------------------------------------------
@@ -151,10 +158,12 @@ def test_pdf_complex_layout(svc: MockOCRService) -> None:
 def test_pdf_multipage(svc: MockOCRService) -> None:
     # pdfplumber cannot open this file (Unexpected EOF), so _ocr_full_pages
     # falls back to PyMuPDF for page rendering.  Each page becomes one OCR block.
-    expected = (
-        f"## Page 1\n\n\n{_OCR_BLOCK}\n\n\n"
-        f"## Page 2\n\n\n{_OCR_BLOCK}\n\n\n"
-        f"## Page 3\n\n\n{_OCR_BLOCK}"
+    expected = _SCANNED_PAGE_SEPARATOR.join(
+        [
+            f"## Page 1\n\n\n\n\n{_OCR_BLOCK}",
+            f"## Page 2\n\n\n\n\n{_OCR_BLOCK}",
+            f"## Page 3\n\n\n\n\n{_OCR_BLOCK}",
+        ]
     )
     assert _convert("pdf_multipage.pdf", svc) == expected
 
@@ -181,10 +190,12 @@ def test_pdf_scanned_sales_report(svc: MockOCRService) -> None:
 
 
 def test_pdf_scanned_report(svc: MockOCRService) -> None:
-    expected = (
-        f"{_PAGE_1_SCANNED}\n\n\n\n"
-        f"## Page 2\n\n\n\n\n{_OCR_BLOCK}\n\n\n\n"
-        f"## Page 3\n\n\n\n\n{_OCR_BLOCK}"
+    expected = _SCANNED_PAGE_SEPARATOR.join(
+        [
+            _PAGE_1_SCANNED,
+            f"## Page 2\n\n\n\n\n{_OCR_BLOCK}",
+            f"## Page 3\n\n\n\n\n{_OCR_BLOCK}",
+        ]
     )
     assert _convert("pdf_scanned_report.pdf", svc) == expected
 
@@ -212,7 +223,7 @@ def test_pdf_scanned_fallback_format(svc: MockOCRService) -> None:
         with open(path, "rb") as f:
             md = converter._ocr_full_pages(io.BytesIO(f.read()), svc)
 
-    expected = "## Page 1\n\n\n" "*[Image OCR]\nMOCK_OCR_TEXT_12345\n[End OCR]*"
+    expected = "## Page 1\n\n\n\n\n" "*[Image OCR]\nMOCK_OCR_TEXT_12345\n[End OCR]*"
     assert (
         md == expected
     ), f"_ocr_full_pages must produce:\n{expected!r}\nActual:\n{md!r}"
